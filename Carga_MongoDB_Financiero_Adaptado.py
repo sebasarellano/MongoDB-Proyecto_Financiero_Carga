@@ -2,18 +2,29 @@
 # CARGA MONGODB — CON DATOS REALES (miles de transacciones)
 # =============================================================
 
-from pymongo import MongoClient
-import pandas as pd
-from datetime import datetime
+import hashlib
+import json
 import os
+from datetime import datetime
 
-# Conexión a MongoDB usando variables de entorno (Más seguro para GitHub)
-# Si no encuentra la variable de entorno, usa una estructura de respaldo de ejemplo
-MONGO_URI = os.getenv("MONGO_URI", "mongodb+srv://usuario:contraseña@cluster0.sh0uytt.mongodb.net/?appName=Cluster0")
-client = MongoClient(MONGO_URI)
-db = client['sector_financiero_ec']
+import pandas as pd
+from dotenv import load_dotenv
+from pymongo import MongoClient
 
-print("✅ Conectado a MongoDB\n")
+# Carga las variables de un archivo .env local, si existe.
+# El archivo .env no debe subirse a GitHub.
+load_dotenv()
+
+MONGO_URI = os.getenv("MONGO_URI")
+if not MONGO_URI:
+    raise RuntimeError(
+        "Falta MONGO_URI. Crea un archivo .env basado en .env.example "
+        "o define la variable de entorno antes de ejecutar el script."
+    )
+
+# MongoClient conecta de forma diferida; el ping se valida en main().
+client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+db = client["sector_financiero_ec"]
 
 
 # =============================================================
@@ -438,11 +449,12 @@ def cargar_perfiles_entidad_reales():
         }
     ]
     
-    coleccion = db['perfiles_entidad']
-    coleccion.delete_many({})
-    
-    resultado = coleccion.insert_many(perfiles)
-    print(f"   ✅ {len(resultado)} perfiles de bancos cargados\n")
+    # Actualiza cada perfil por su identificador estable sin borrar la colección.
+    coleccion = db["perfiles_entidad"]
+    for perfil in perfiles:
+        coleccion.replace_one({"_id": perfil["_id"]}, perfil, upsert=True)
+
+    print(f"   ✅ {len(perfiles)} perfiles de bancos actualizados o insertados\n")
 
 
 # =============================================================
@@ -451,66 +463,81 @@ def cargar_perfiles_entidad_reales():
 
 def cargar_volumen_credito_desde_excel(carpeta_volumenes):
     """
-    Lee directamente los archivos Excel de volumen de crédito
-    y carga los registros a MongoDB
+    Valida y procesa los archivos Excel antes de escribir en MongoDB.
+    No borra documentos existentes; usa identificadores deterministas y upsert.
     """
-    
-    print("📊 Cargando VOLUMEN_CREDITO_GRANULAR desde Excel...")
-    
+    print("📊 Validando archivos de VOLUMEN_CREDITO_GRANULAR...")
+
     archivos = [
         "VOLUMEN_CREDITO_2023.xlsx",
         "VOLUMEN_CREDITO_2024.xlsx",
         "VOLUMEN_CREDITO_2025.xlsx",
     ]
-    
-    coleccion = db['volumen_credito_granular']
-    coleccion.delete_many({})
-    
-    total_registros = 0
-    
-    for archivo in archivos:
-        ruta = os.path.join(carpeta_volumenes, archivo)
-        
-        if not os.path.exists(ruta):
-            print(f"   ⚠️  No encontrado: {ruta}")
-            continue
-        
-        print(f"   📄 Leyendo {archivo}...")
-        
-        try:
-            df = pd.read_excel(
-                ruta,
-                sheet_name='Volumen de Crédito',
-                header=8,
-                dtype={
-                    "NÚMERO DE OPERACIONES": int,
-                    "MONTO OTORGADO": float,
-                }
+    rutas = [os.path.join(carpeta_volumenes, archivo) for archivo in archivos]
+    faltantes = [ruta for ruta in rutas if not os.path.isfile(ruta)]
+    if faltantes:
+        raise FileNotFoundError(
+            "No se inició la carga de volumen de crédito. Faltan archivos: "
+            + ", ".join(faltantes)
+        )
+
+    columnas_requeridas = [
+        "FECHA", "ENTIDAD", "TIPO DE CREDITO", "ESTADO DE LA OPERACION",
+        "PROVINCIA", "CANTON", "SECTOR", "SUBSECTOR", "SUBSISTEMA",
+        "NÚMERO DE OPERACIONES", "MONTO OTORGADO",
+    ]
+    dataframes = []
+
+    # Lee y valida todos los Excel antes de empezar a escribir.
+    for ruta in rutas:
+        print(f"   📄 Leyendo {ruta}...")
+        df = pd.read_excel(ruta, sheet_name="Volumen de Crédito", header=8)
+
+        faltan_columnas = [col for col in columnas_requeridas if col not in df.columns]
+        if faltan_columnas:
+            raise ValueError(
+                f"{os.path.basename(ruta)} no contiene las columnas requeridas: "
+                + ", ".join(faltan_columnas)
             )
-            
-            print(f"      {len(df):,} filas leídas")
-            
-            df = df[df["SUBSISTEMA"].str.strip().str.upper() == "BANCOS PRIVADOS"].copy()
-            
-            df.dropna(subset=["FECHA", "ENTIDAD", "PROVINCIA", "MONTO OTORGADO"], inplace=True)
-            df = df[df["MONTO OTORGADO"] > 0].copy()
-            
-            for col in ["ENTIDAD", "TIPO DE CREDITO", "PROVINCIA", "SECTOR"]:
-                df[col] = df[col].astype(str).str.strip()
-            
-            df["FECHA"] = pd.to_datetime(df["FECHA"])
-            df["anio"] = df["FECHA"].dt.year
-            df["mes"] = df["FECHA"].dt.month
-            df["trimestre"] = df["mes"].apply(lambda m: f"Q{(m-1)//3 + 1}")
-            
-            df_mongo = df[[
-                "FECHA", "anio", "mes", "trimestre",
-                "ENTIDAD", "TIPO DE CREDITO", "ESTADO DE LA OPERACION",
-                "PROVINCIA", "CANTON", "SECTOR", "SUBSECTOR",
-                "NÚMERO DE OPERACIONES", "MONTO OTORGADO"
-            ]].copy()
-            
-            df_mongo.rename(columns={
+
+        df = df.copy()
+        df["SUBSISTEMA"] = df["SUBSISTEMA"].astype("string").str.strip().str.upper()
+        df = df[df["SUBSISTEMA"] == "BANCOS PRIVADOS"].copy()
+
+        df["MONTO OTORGADO"] = pd.to_numeric(df["MONTO OTORGADO"], errors="coerce")
+        df["NÚMERO DE OPERACIONES"] = pd.to_numeric(
+            df["NÚMERO DE OPERACIONES"], errors="coerce"
+        )
+        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+        df.dropna(
+            subset=[
+                "FECHA", "ENTIDAD", "PROVINCIA",
+                "MONTO OTORGADO", "NÚMERO DE OPERACIONES",
+            ],
+            inplace=True,
+        )
+        df = df[df["MONTO OTORGADO"] > 0].copy()
+
+        for col in [
+            "ENTIDAD", "TIPO DE CREDITO", "ESTADO DE LA OPERACION",
+            "PROVINCIA", "CANTON", "SECTOR", "SUBSECTOR",
+        ]:
+            df[col] = df[col].astype("string").str.strip()
+
+        df["anio"] = df["FECHA"].dt.year
+        df["mes"] = df["FECHA"].dt.month
+        df["trimestre"] = df["mes"].apply(lambda mes: f"Q{(mes - 1) // 3 + 1}")
+
+        df_mongo = df[
+            [
+                "FECHA", "anio", "mes", "trimestre", "ENTIDAD",
+                "TIPO DE CREDITO", "ESTADO DE LA OPERACION", "PROVINCIA",
+                "CANTON", "SECTOR", "SUBSECTOR",
+                "NÚMERO DE OPERACIONES", "MONTO OTORGADO",
+            ]
+        ].copy()
+        df_mongo.rename(
+            columns={
                 "FECHA": "fecha",
                 "ENTIDAD": "entidad",
                 "TIPO DE CREDITO": "tipo_credito",
@@ -521,19 +548,39 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
                 "SUBSECTOR": "subsector",
                 "NÚMERO DE OPERACIONES": "num_operaciones",
                 "MONTO OTORGADO": "monto_otorgado",
-            }, inplace=True)
-            
-            registros = df_mongo.to_dict('records')
-            
-            if registros:
-                coleccion.insert_many(registros, ordered=False)
-                total_registros += len(registros)
-                print(f"      ✅ {len(registros):,} registros cargados")
-        
-        except Exception as e:
-            print(f"      ❌ Error leyendo {archivo}: {e}")
-    
-    print(f"   ✅ TOTAL: {total_registros:,} registros de volumen cargados\n")
+            },
+            inplace=True,
+        )
+        dataframes.append(df_mongo)
+        print(f"      {len(df_mongo):,} registros válidos preparados")
+
+    if not any(not df.empty for df in dataframes):
+        raise ValueError("No se encontraron registros válidos; no se modificó MongoDB.")
+
+    coleccion = db["volumen_credito_granular"]
+    total = 0
+    tamano_lote = 500
+
+    for df in dataframes:
+        registros = df.to_dict("records")
+        for registro in registros:
+            firma = json.dumps(
+                registro, sort_keys=True, default=str, ensure_ascii=False
+            )
+            registro["_id"] = hashlib.sha256(firma.encode("utf-8")).hexdigest()
+
+        for inicio in range(0, len(registros), tamano_lote):
+            lote = registros[inicio:inicio + tamano_lote]
+            for registro in lote:
+                coleccion.replace_one(
+                    {"_id": registro["_id"]}, registro, upsert=True
+                )
+            total += len(lote)
+
+    print(
+        f"   ✅ {total:,} registros procesados mediante upsert. "
+        "Los documentos anteriores no se borraron.\n"
+    )
 
 
 # =============================================================
@@ -601,11 +648,17 @@ def cargar_eventos_supervision_reales():
         },
     ]
     
-    coleccion = db['eventos_supervision']
-    coleccion.delete_many({})
-    
-    resultado = coleccion.insert_many(eventos)
-    print(f"   ✅ {len(resultado)} eventos de supervisión cargados\n")
+    coleccion = db["eventos_supervision"]
+    for evento in eventos:
+        # Clave natural estable para que ejecutar el proceso de nuevo no duplique eventos.
+        clave = {
+            "fecha": evento["fecha"],
+            "tipo": evento["tipo"],
+            "entidad_afectada": evento["entidad_afectada"],
+        }
+        coleccion.update_one(clave, {"$set": evento}, upsert=True)
+
+    print(f"   ✅ {len(eventos)} eventos actualizados o insertados\n")
 
 
 # =============================================================
@@ -630,24 +683,36 @@ def crear_indices():
 
 def main():
     print("=" * 70)
-    print("  CARGA DE MONGODB — CON DATOS REALES")
+    print("  CARGA DE MONGODB")
     print("=" * 70 + "\n")
-    
-    # Ruta relativa limpia orientada al proyecto
-    CARPETA_VOLUMENES = "./data"
-    
-    cargar_perfiles_entidad_reales()
-    cargar_volumen_credito_desde_excel(CARPETA_VOLUMENES)
-    cargar_eventos_supervision_reales()
-    crear_indices()
-    
-    print("=" * 70)
-    print("  ✅ MONGODB CARGADO CORRECTAMENTE")
-    print("=" * 70)
-    print("\n📊 Estadísticas de carga:")
-    print(f"   perfiles_entidad: {db['perfiles_entidad'].count_documents({})}")
-    print(f"   volumen_credito_granular: {db['volumen_credito_granular'].count_documents({})}")
-    print(f"   eventos_supervision: {db['eventos_supervision'].count_documents({})}")
+
+    try:
+        # Verifica autenticación, red y disponibilidad antes de escribir.
+        client.admin.command("ping")
+        print("✅ Conexión con MongoDB verificada.\n")
+
+        carpeta_volumenes = os.path.join(os.path.dirname(__file__), "data")
+
+        # Los Excel se validan primero. Si falta uno o su estructura cambió,
+        # el proceso se detiene antes de tocar las otras colecciones.
+        cargar_volumen_credito_desde_excel(carpeta_volumenes)
+        cargar_perfiles_entidad_reales()
+        cargar_eventos_supervision_reales()
+        crear_indices()
+
+        print("=" * 70)
+        print("  ✅ CARGA FINALIZADA")
+        print("=" * 70)
+        print("\n📊 Conteo de documentos:")
+        print(f"   perfiles_entidad: {db['perfiles_entidad'].count_documents({})}")
+        print(f"   volumen_credito_granular: {db['volumen_credito_granular'].count_documents({})}")
+        print(f"   eventos_supervision: {db['eventos_supervision'].count_documents({})}")
+
+    except Exception as error:
+        print(f"\n❌ La carga no finalizó correctamente: {error}")
+        raise
+    finally:
+        client.close()
 
 
 if __name__ == "__main__":
