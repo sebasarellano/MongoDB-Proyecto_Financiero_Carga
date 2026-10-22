@@ -463,8 +463,8 @@ def cargar_perfiles_entidad_reales():
 
 def cargar_volumen_credito_desde_excel(carpeta_volumenes):
     """
-    Valida y procesa todos los Excel antes de reemplazar la colección.
-    Si un archivo falta o no se puede procesar, conserva los datos actuales.
+    Valida y procesa los archivos Excel antes de escribir en MongoDB.
+    No borra documentos existentes; usa identificadores deterministas y upsert.
     """
     print("📊 Validando archivos de VOLUMEN_CREDITO_GRANULAR...")
 
@@ -473,13 +473,11 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
         "VOLUMEN_CREDITO_2024.xlsx",
         "VOLUMEN_CREDITO_2025.xlsx",
     ]
-
-    # Se exige el conjunto completo para no publicar una carga parcial por accidente.
     rutas = [os.path.join(carpeta_volumenes, archivo) for archivo in archivos]
     faltantes = [ruta for ruta in rutas if not os.path.isfile(ruta)]
     if faltantes:
         raise FileNotFoundError(
-            "No se reemplazó volumen_credito_granular. Faltan archivos: "
+            "No se inició la carga de volumen de crédito. Faltan archivos: "
             + ", ".join(faltantes)
         )
 
@@ -490,19 +488,15 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
     ]
     dataframes = []
 
-    # Primero se leen y validan los tres archivos. Hasta aquí no se modifica MongoDB.
+    # Lee y valida todos los Excel antes de empezar a escribir.
     for ruta in rutas:
         print(f"   📄 Leyendo {ruta}...")
-        df = pd.read_excel(
-            ruta,
-            sheet_name="Volumen de Crédito",
-            header=8,
-        )
+        df = pd.read_excel(ruta, sheet_name="Volumen de Crédito", header=8)
 
         faltan_columnas = [col for col in columnas_requeridas if col not in df.columns]
         if faltan_columnas:
             raise ValueError(
-                f"El archivo {os.path.basename(ruta)} no contiene las columnas: "
+                f"{os.path.basename(ruta)} no contiene las columnas requeridas: "
                 + ", ".join(faltan_columnas)
             )
 
@@ -515,7 +509,6 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
             df["NÚMERO DE OPERACIONES"], errors="coerce"
         )
         df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
-
         df.dropna(
             subset=[
                 "FECHA", "ENTIDAD", "PROVINCIA",
@@ -543,7 +536,6 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
                 "NÚMERO DE OPERACIONES", "MONTO OTORGADO",
             ]
         ].copy()
-
         df_mongo.rename(
             columns={
                 "FECHA": "fecha",
@@ -563,42 +555,34 @@ def cargar_volumen_credito_desde_excel(carpeta_volumenes):
         print(f"      {len(df_mongo):,} registros válidos preparados")
 
     if not any(not df.empty for df in dataframes):
-        raise ValueError(
-            "Los archivos no generaron registros válidos. "
-            "Se conservó la colección anterior."
-        )
+        raise ValueError("No se encontraron registros válidos; no se modificó MongoDB.")
 
-    # Identificadores deterministas: repetir la carga no crea duplicados en el staging.
-    registros_por_id = {}
+    coleccion = db["volumen_credito_granular"]
+    total = 0
+    tamano_lote = 500
+
     for df in dataframes:
-        for registro in df.to_dict("records"):
-            firma = json.dumps(registro, sort_keys=True, default=str, ensure_ascii=False)
+        registros = df.to_dict("records")
+        for registro in registros:
+            firma = json.dumps(
+                registro, sort_keys=True, default=str, ensure_ascii=False
+            )
             registro["_id"] = hashlib.sha256(firma.encode("utf-8")).hexdigest()
-            registros_por_id[registro["_id"]] = registro
 
-    nombre_objetivo = "volumen_credito_granular"
-    nombre_temporal = "volumen_credito_granular_staging"
-    staging = db[nombre_temporal]
-
-    try:
-        staging.drop()
-        registros = list(registros_por_id.values())
-
-        # Insertar en lotes para evitar una única operación excesivamente grande.
-        tamano_lote = 1000
         for inicio in range(0, len(registros), tamano_lote):
-            staging.insert_many(registros[inicio:inicio + tamano_lote], ordered=True)
-
-        # Solo después de completar la carga se sustituye la colección publicada.
-        staging.rename(nombre_objetivo, dropTarget=True)
-    except Exception:
-        staging.drop()
-        raise
+            lote = registros[inicio:inicio + tamano_lote]
+            for registro in lote:
+                coleccion.replace_one(
+                    {"_id": registro["_id"]}, registro, upsert=True
+                )
+            total += len(lote)
 
     print(
-        f"   ✅ Reemplazo seguro completado: {len(registros):,} registros. "
-        "La colección anterior se mantuvo hasta terminar la nueva carga.\n"
+        f"   ✅ {total:,} registros procesados mediante upsert. "
+        "Los documentos anteriores no se borraron.\n"
     )
+
+
 # =============================================================
 # COLECCIÓN 3: EVENTOS DE SUPERVISIÓN
 # =============================================================
@@ -703,14 +687,14 @@ def main():
     print("=" * 70 + "\n")
 
     try:
-        # Comprueba autenticación, red y disponibilidad antes de escribir datos.
+        # Verifica autenticación, red y disponibilidad antes de escribir.
         client.admin.command("ping")
         print("✅ Conexión con MongoDB verificada.\n")
 
         carpeta_volumenes = os.path.join(os.path.dirname(__file__), "data")
 
-        # Se procesa primero el conjunto Excel: si falla, no se modifican las
-        # colecciones de perfiles ni de eventos.
+        # Los Excel se validan primero. Si falta uno o su estructura cambió,
+        # el proceso se detiene antes de tocar las otras colecciones.
         cargar_volumen_credito_desde_excel(carpeta_volumenes)
         cargar_perfiles_entidad_reales()
         cargar_eventos_supervision_reales()
